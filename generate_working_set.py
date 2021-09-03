@@ -4,7 +4,7 @@ import argparse
 
 from pyspark import SparkConf, SparkContext
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, when
 import pyspark.sql.functions as fn
 import pyspark.sql.types as types
 
@@ -36,6 +36,7 @@ def get_df_condor(spark, dates):
                             "CMS_SubmissionTool", types.StringType(), True
                         ),
                         types.StructField("Status", types.StringType(), True),
+#                        types.StructField("FileSystemDomain", types.StringType(), True),
                     ]
                 ),
                 False,
@@ -54,6 +55,7 @@ def get_df_condor(spark, dates):
         .drop("RecordTime")
         .withColumnRenamed("DESIRED_CMSDataset", "dataset_name")
         .withColumnRenamed("Site", "site_name")
+#        .withColumnRenamed("FileSystemDomain", "server_domain")
     )
     return df
 
@@ -77,6 +79,8 @@ def get_df_cmssw(spark, dates):
                         types.StructField("end_time", types.LongType(), True),
                         types.StructField("app_info", types.StringType(), True),
                         types.StructField("site_name", types.StringType(), True),
+                        types.StructField("server_domain", types.StringType(), True),
+                        types.StructField("fallback", types.StringType(), True),
                     ]
                 ),
                 False,
@@ -88,11 +92,29 @@ def get_df_cmssw(spark, dates):
         .json("/project/monitoring/archive/cmssw_pop/raw/metric/%s/*.json.gz" % dates)
         .select("data.*")
     )
+    df_dom = (
+        spark.read
+        .json("/user/chmcgrad/domain_map/*.json")
+    )
     df = (
         df.filter(df.file_lfn.startswith("/store/"))
         .withColumn("is_crab", df.app_info.contains(":crab:"))
         .drop("app_info")
         .withColumnRenamed("end_time", "timestamp")
+        .join(df_dom, (df.server_domain == df_dom.domain), how = 'left')
+        .withColumn("is_local", 
+                    when((df.server_domain == 'unknown'), True)
+                    .when((df.server_domain == "in2p3.fr") 
+                          & df.site_name.isin("T1_FR_CCIN2P3_Disk", "T2_FR_IPHC", "T2_FR_GRIF_LLR", "T2_FR_CCIN2P3"), True)
+                    .when((df.server_domain == "in2p3.fr") 
+                          & ~df.site_name.isin("T1_FR_CCIN2P3_Disk", "T2_FR_IPHC", "T2_FR_GRIF_LLR", "T2_FR_CCIN2P3"), False)
+                    .when(df.site_name == df_dom.site, True)
+                    .when(df.fallback == 'true', False)
+                    .otherwise(None))
+        .drop("server_domain")
+        .drop("fallback")
+        .drop("domain")
+        .drop("site")
     )
     return df
 
@@ -206,7 +228,7 @@ def run(args):
             .withColumn("day", (col("timestamp") - col("timestamp") % fn.lit(86400)))
             .join(dbs_files, col("file_lfn") == col("f_logical_file_name"))
             .join(dbs_datasets, col("f_dataset_id") == col("d_dataset_id"))
-            .groupBy("day", "input_campaign", "d_data_tier_id", "site_name", "is_crab")
+            .groupBy("day", "input_campaign", "d_data_tier_id", "site_name", "is_crab", "is_local")
             .agg(
                 fn.collect_set("f_block_id").alias("working_set_blocks"),
             )
@@ -242,7 +264,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Computes working set (unique blocks accessed) per day, partitioned by various fields."
     )
-    defpath = "hdfs://analytix/user/ncsmith/working_set_day"
+    defpath = "hdfs://analytix/user/chmcgrad/working_set_day"
     parser.add_argument(
         "--out",
         metavar="OUTPUT",
